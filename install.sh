@@ -37,6 +37,23 @@ run_as() { if [ "$(id -un)" = "$RUN_USER" ]; then "$@"; else $SUDO -u "$RUN_USER
 [ -f "$SRC_DIR/adamo_xr_relay.py" ] || die "adamo_xr_relay.py not found next to install.sh"
 say "Adamo teleop installer  (user=$RUN_USER  dir=$INSTALL_DIR  adamo==$ADAMO_VERSION)"
 
+# --- 0. interactive config (prompt up front, before any slow install work) ---
+old_key=""; old_name="openarm"; old_arm="openarm_v2"; old_domain="0"; old_distro="jazzy"
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$ENV_FILE" 2>/dev/null || true
+  old_key="${ADAMO_API_KEY:-}"; old_name="${ADAMO_ROBOT_NAME:-openarm}"
+  old_arm="${ANVIL_ARM_TYPE:-openarm_v2}"; old_domain="${ROS_DOMAIN_ID:-0}"; old_distro="${ROS_DISTRO:-jazzy}"
+fi
+echo; say "Configuration (press Enter to accept the [default])"
+kp="  ADAMO_API_KEY"; [ -n "$old_key" ] && kp="$kp (Enter to keep existing)"
+read -r -p "$kp: " in_key; API_KEY="${in_key:-$old_key}"
+[ -n "$API_KEY" ] || die "An API key is required."
+read -r -p "  ADAMO_ROBOT_NAME [$old_name]: "  x; ROBOT_NAME="${x:-$old_name}"
+read -r -p "  ANVIL_ARM_TYPE   [$old_arm]: "   x; ARM_TYPE="${x:-$old_arm}"
+read -r -p "  ROS_DOMAIN_ID    [$old_domain]: " x; ROS_DOMAIN_ID="${x:-$old_domain}"
+read -r -p "  ROS_DISTRO       [$old_distro]: " x; ROS_DISTRO="${x:-$old_distro}"
+
 # --- 1. system prerequisites -------------------------------------------------
 say "Updating apt and detecting the GPU…"
 $SUDO apt-get update -qq
@@ -82,23 +99,7 @@ run_as cp "$SRC_DIR/adamo_video.py" "$SRC_DIR/adamo_xr_relay.py" "$INSTALL_DIR/"
 # even if the video service is down). Not wired to a service by default.
 [ -f "$SRC_DIR/adamo_xr_relay_zenoh.py" ] && run_as cp "$SRC_DIR/adamo_xr_relay_zenoh.py" "$INSTALL_DIR/" || true
 
-# --- 4. interactive config (.env) -------------------------------------------
-old_key=""; old_name="openarm"; old_arm="openarm_v2"; old_domain="0"; old_distro="jazzy"
-if [ -f "$ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  . "$ENV_FILE" 2>/dev/null || true
-  old_key="${ADAMO_API_KEY:-}"; old_name="${ADAMO_ROBOT_NAME:-openarm}"
-  old_arm="${ANVIL_ARM_TYPE:-openarm_v2}"; old_domain="${ROS_DOMAIN_ID:-0}"; old_distro="${ROS_DISTRO:-jazzy}"
-fi
-echo; say "Configuration (press Enter to accept the [default])"
-kp="  ADAMO_API_KEY"; [ -n "$old_key" ] && kp="$kp (Enter to keep existing)"
-read -rs -p "$kp: " in_key; echo; API_KEY="${in_key:-$old_key}"
-[ -n "$API_KEY" ] || die "An API key is required."
-read -r -p "  ADAMO_ROBOT_NAME [$old_name]: "  x; ROBOT_NAME="${x:-$old_name}"
-read -r -p "  ANVIL_ARM_TYPE   [$old_arm]: "   x; ARM_TYPE="${x:-$old_arm}"
-read -r -p "  ROS_DOMAIN_ID    [$old_domain]: " x; ROS_DOMAIN_ID="${x:-$old_domain}"
-read -r -p "  ROS_DISTRO       [$old_distro]: " x; ROS_DISTRO="${x:-$old_distro}"
-
+# --- 4. write config (.env) --------------------------------------------------
 run_as tee "$ENV_FILE" >/dev/null <<EOF
 # Adamo teleop configuration. Org is derived from the API key — do not add it.
 ADAMO_API_KEY=$API_KEY
