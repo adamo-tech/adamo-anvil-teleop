@@ -48,6 +48,18 @@ XR_BUTTON_Y = 5
 TRIGGER_AXIS_INDEX = 4
 GRIP_AXIS_INDEX = 5
 XR_STALE_TIMEOUT_S = 1.0
+# Re-engagement jump guard. Lifting the Quest off and back on interrupts the XR
+# pose stream (WebXR standby) or re-initializes controller tracking, which the
+# 1s stale timeout can miss (a <1s gap, or an app that keeps streaming a frozen
+# pose). If the arm stays engaged across that, it drives to its pre-interruption
+# anchor on resume — a dangerous jolt. So treat ANY pose-stream discontinuity as
+# lost tracking: disengage and force a fresh grip-release before re-engaging (which
+# re-anchors at the current EE). A gap between a controller's consecutive poses, or
+# an implausibly large pose jump, both count as a discontinuity. (Because the
+# rosbridge link self-heals, a reconnect gap trips this too — teleop won't silently
+# resume mid-motion after a backend restart.)
+XR_INPUT_GAP_DISENGAGE_S = 0.4   # >0.4s between one controller's poses = interruption
+XR_CTRL_JUMP_DISENGAGE_M = 0.20  # >20cm between consecutive poses = tracking re-init/teleport
 
 
 def _axis_or_button(axes, buttons, btn, axis) -> float:
@@ -129,6 +141,11 @@ class RosBridge:
         self.last_msg_time = 0.0
         self.rx_count = 0
         self.rx_parse_errors = 0
+        # Per-controller last pose + arrival time, for the discontinuity guard.
+        self._pose_time = {"left": 0.0, "right": 0.0}
+        self._pose_last = {"left": None, "right": None}
+        self.discontinuity = False
+        self.discontinuity_reason = ""
         self.ee_pose: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
         self._ee_subscribed: set[str] = set()
         self._advertised: set[str] = set()
@@ -230,10 +247,25 @@ class RosBridge:
                 self.rx_parse_errors += 1
             return
         with self._state_lock:
-            self.last_msg_time = time.time()
+            now = time.time()
+            self.last_msg_time = now
             self.rx_count += 1
-            st = self.left if topic.startswith("/controller/left") else self.right
+            side = "left" if topic.startswith("/controller/left") else "right"
+            st = self.left if side == "left" else self.right
             st.position, st.orientation = pos, quat
+            prev_t = self._pose_time[side]
+            prev_p = self._pose_last[side]
+            if prev_t > 0.0 and prev_p is not None:
+                gap = now - prev_t
+                jump = float(np.linalg.norm(pos - prev_p))
+                if gap > XR_INPUT_GAP_DISENGAGE_S:
+                    self.discontinuity = True
+                    self.discontinuity_reason = f"{side} pose gap {gap * 1000:.0f}ms"
+                elif jump > XR_CTRL_JUMP_DISENGAGE_M:
+                    self.discontinuity = True
+                    self.discontinuity_reason = f"{side} pose jump {jump * 100:.0f}cm in {gap * 1000:.0f}ms"
+            self._pose_time[side] = now
+            self._pose_last[side] = pos
 
     def _on_joy(self, topic: str, m: dict) -> None:
         axes = m.get("axes", [])
@@ -256,7 +288,9 @@ class RosBridge:
                     None if s.orientation is None else s.orientation.copy(),
                     s.trigger, s.grip, s.stick_pressed, s.x_pressed, s.y_pressed,
                 )
-            return copy(self.left), copy(self.right), self.last_msg_time, self.rx_count, self.rx_parse_errors
+            disc, disc_reason = self.discontinuity, self.discontinuity_reason
+            self.discontinuity = False
+            return copy(self.left), copy(self.right), self.last_msg_time, self.rx_count, self.rx_parse_errors, disc, disc_reason
 
     # --- EE anchoring + reset + commanded output ---
 
@@ -445,7 +479,7 @@ def main() -> None:
     was_stale = True
     while True:
         t0 = time.time()
-        l, r, last_msg, rx_count, rx_errors = bridge.snapshot()
+        l, r, last_msg, rx_count, rx_errors, disc, disc_reason = bridge.snapshot()
         stale = last_msg == 0.0 or t0 - last_msg > XR_STALE_TIMEOUT_S
         if stale and not was_stale:
             for arm in arms:
@@ -453,6 +487,18 @@ def main() -> None:
             grip_release_required = True
             print(f"[relay] XR input timed out after {XR_STALE_TIMEOUT_S:g}s - disengaged; release grips to re-engage", flush=True)
         was_stale = stale
+
+        # Tracking-discontinuity guard (headset off/on, standby, re-init, rosbridge
+        # reconnect): a gap or teleport in the pose stream means the anchor is stale.
+        # Disengage and force a fresh grip-release so re-engagement re-anchors at the
+        # current EE, never jolting to the pre-interruption target.
+        if disc:
+            was_engaged = any(arm.engaged for arm in arms)
+            for arm in arms:
+                arm.disengage(bridge)
+            grip_release_required = True
+            if was_engaged or not stale:
+                print(f"[relay] XR tracking discontinuity ({disc_reason}) - disengaged; release grips to re-engage", flush=True)
 
         if l.x_pressed and not prev_scale_button:
             old = active_scale
