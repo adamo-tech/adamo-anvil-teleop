@@ -1,55 +1,115 @@
-# Adamo Teleop — robot workcell package
+# Adamo Teleop for Anvil
 
-Streams the anvil's ROS cameras over the adamo SDK and relays WebXR
-teleoperation into the arms. Two systemd services, one installer.
+Use this package to connect an Anvil robot workcell to Adamo for camera streaming
+and WebXR teleoperation.
+
+## Before you start
+
+You need:
+
+- An Anvil workcell with Docker, systemd, and ROS running
+- rosbridge available at `ws://localhost:9090`
+- An Adamo API key from [operate.adamohq.com](https://operate.adamohq.com)
+- `sudo` access on the workcell
+
+The workcell should publish these compressed camera topics:
+
+```text
+/cam_wrist_l/image_raw/compressed
+/cam_wrist_r/image_raw/compressed
+/cam_chest/image_raw/compressed
+```
 
 ## Install
-```
+
+Clone this repository on the Anvil workcell and run the installer as your normal
+workcell user:
+
+```bash
 ./install.sh
 ```
-**Interactive**. Answer two prompts (adamo API key, robot name).
-You can get your API key from operate.adamohq.com.
-Your organization is derived from the API key; it is never entered or stored.
 
-## What it installs
-- **adamo-video** (the *adamo-service*) — publishes
-  `/cam_{wrist_l,wrist_r,chest}/image_raw/compressed` over the adamo SDK (native
-  ros2dds ingestion, VA-API H.264), registers the robot on the adamo mesh, and
-  runs the SDK's control fan-out that exposes the operator's controllers as
-  native ROS topics (`/controller/*`). This is the only process that touches the
-  adamo SDK / zenoh / your API key.
-- **adamo-xr-relay** — a **plain ROS node** (rosbridge only; no adamo import, 
-  no API key) that subscribes to the fanned `/controller/{left,right}`
-  (+`/joy`), applies the WebXR→robot transform + gripper mapping, and publishes
-  engage-gated `/commanded_ee_{left,right}`. Grip engages (deadman: the arm holds
-  when you release); it anchors to the robot's live `/ee_pose_*` so re-engaging
-  never jumps. The rosbridge connection **self-heals** — if the workcell
-  container/rosbridge restarts, it reconnects and re-subscribes automatically, no
-  relay restart needed. Because it's ordinary ROS, you can read it and re-map it
-  to a different robot's command topic/message.
+The installer asks for:
 
-## Requirements (installed automatically)
-`python3-venv`; GStreamer plugins base/good/bad; a VA-API driver for hardware
-H.264 (Intel → `intel-media-va-driver-non-free`, AMD → `mesa-va-drivers`);
-`adamo>=0.4.50`, `numpy`, `websockets`. The workcell must already expose
-**rosbridge on `ws://localhost:9090`** and publish the three compressed camera
-topics. Camera topic names differing? Edit the `CAMERAS` tuple in
-`adamo_video.py` and the topic subscribe in the relay.
+- Adamo API key
+- Robot name as it should appear in Adamo
+- Anvil arm type
+- ROS domain ID
+- ROS distribution
 
-## Operate / debug
+Press Enter to retain an existing value when reinstalling. Your Adamo
+organization is determined automatically from the API key.
+
+The installer adds the required system packages and Python dependencies,
+creates `~/adamo-teleop`, and enables the Adamo services. It also installs the
+compatibility support required for the current Anvil ROS release.
+
+## Verify the installation
+
+Check that the services are running:
+
+```bash
+systemctl status adamo-video adamo-xr-relay
+systemctl status adamo-anvil-container-patch.timer
 ```
+
+Then sign in to [operate.adamohq.com](https://operate.adamohq.com) and confirm
+that the configured robot is online and its camera feeds are available.
+
+Follow service logs when troubleshooting:
+
+```bash
 journalctl -u adamo-video -f
 journalctl -u adamo-xr-relay -f
+journalctl -u adamo-anvil-container-patch -f
 ```
-Safe dry-run (logs commanded poses, publishes nothing → arms stay still):
+
+## Reconfigure or update
+
+Re-run the installer to update the installed files or change configuration:
+
+```bash
+./install.sh
 ```
+
+Existing values are offered as defaults. Configuration is stored in
+`~/adamo-teleop/.env`.
+
+After manually editing that file, restart the Adamo services:
+
+```bash
+sudo systemctl restart adamo-video adamo-xr-relay
+```
+
+Common settings are:
+
+```text
+ADAMO_ROBOT_NAME
+ANVIL_ARM_TYPE
+ROS_DOMAIN_ID
+ROS_DISTRO
+RUST_LOG
+```
+
+## Safe relay test
+
+To inspect incoming controller commands without publishing arm targets, stop the
+managed relay and run it in dry-run mode:
+
+```bash
 sudo systemctl stop adamo-xr-relay
 ~/adamo-teleop/venv/bin/python ~/adamo-teleop/adamo_xr_relay.py --dry-run
 ```
 
-## Tune / reconfigure
-Re-run `./install.sh`, or edit `~/adamo-teleop/.env`
-(`ADAMO_ROBOT_NAME`, `ANVIL_ARM_TYPE`, `ROS_DOMAIN_ID`, `RUST_LOG`) then
-`sudo systemctl restart adamo-video adamo-xr-relay`.
-Relay motion knobs: `--scale`, `--rate`, `--max-ee-step`
-(`adamo_xr_relay.py --help`).
+Press Ctrl+C when finished, then restart the service:
+
+```bash
+sudo systemctl restart adamo-xr-relay
+```
+
+Run the relay with `--help` to view the available customer-facing tuning
+options:
+
+```bash
+~/adamo-teleop/venv/bin/python ~/adamo-teleop/adamo_xr_relay.py --help
+```
