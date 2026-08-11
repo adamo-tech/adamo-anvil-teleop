@@ -342,10 +342,25 @@ class RosBridge:
 # -- per-arm engage/delta state -----------------------------------------------
 
 GRIPPER_PROFILES = {
-    "openyam": {"left_open": -0.035, "left_closed": -0.11, "right_open": 0.075, "right_closed": 0.0},
+    "openyam": {"left_open": 0.075, "left_closed": 0.0, "right_open": 0.075, "right_closed": 0.0},
     "openarm": {"left_open": 0.045, "left_closed": 0.0, "right_open": 0.045, "right_closed": 0.0},
     "openarm_v2": {"left_open": 0.045, "left_closed": 0.0, "right_open": 0.045, "right_closed": 0.0},
 }
+
+
+def gripper_profile(arm_type: str) -> dict[str, float]:
+    profile = dict(GRIPPER_PROFILES[arm_type])
+    for key, env_name in (
+        ("left_open", "ANVIL_GRIPPER_LEFT_OPEN"),
+        ("left_closed", "ANVIL_GRIPPER_LEFT_CLOSED"),
+        ("right_open", "ANVIL_GRIPPER_RIGHT_OPEN"),
+        ("right_closed", "ANVIL_GRIPPER_RIGHT_CLOSED"),
+    ):
+        if env_name in os.environ:
+            profile[key] = float(os.environ[env_name])
+    return profile
+
+
 ENGAGE = 0.7
 DISENGAGE = 0.3
 
@@ -457,7 +472,7 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="log commands instead of publishing")
     args = ap.parse_args()
 
-    gp = GRIPPER_PROFILES[args.arm_type]
+    gp = gripper_profile(args.arm_type)
     bridge = RosBridge(args.rosbridge)
     left = Arm("left", args.left_topic, gp["left_open"], gp["left_closed"])
     right = Arm("right", args.right_topic, gp["right_open"], gp["right_closed"])
