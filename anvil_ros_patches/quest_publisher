@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Quest teleop entrypoint wrapper for safe Adamo commanded-EE handoff.
+
+The forward-command gate prevents the controller from replaying stale IK state
+after startup or a reset. OpenYAM additionally needs its calibrated asymmetric
+gripper range; OpenArm keeps the stock RobotConfig and symmetric hand range.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+
+def _arm_type() -> str:
+    return os.environ.get("ANVIL_ARM_TYPE", "openyam").lower()
+
+
+def _profile_default(*, openyam: str, openarm: str) -> str:
+    return openarm if _arm_type().startswith("openarm") else openyam
+
+
+def _right_open() -> float:
+    default = _profile_default(openyam="0.075", openarm="0.045")
+    return float(os.environ.get("ANVIL_GRIPPER_RIGHT_OPEN", os.environ.get("ANVIL_GRIPPER_MAX", default)))
+
+
+def _right_closed() -> float:
+    return float(os.environ.get("ANVIL_GRIPPER_RIGHT_CLOSED", "0.0"))
+
+
+def _left_open() -> float:
+    default = _profile_default(openyam="-0.035", openarm="0.045")
+    return float(os.environ.get("ANVIL_GRIPPER_LEFT_OPEN", default))
+
+
+def _left_closed() -> float:
+    default = _profile_default(openyam="-0.11", openarm="0.0")
+    return float(os.environ.get("ANVIL_GRIPPER_LEFT_CLOSED", default))
+
+
+def _patch_robot_config(robot_config):
+    # OpenArm's stock config already carries its correct 8-joint rest/home
+    # positions and hand limits. Only the custom OpenYAM hardware needs these
+    # values rewritten.
+    if _arm_type().startswith("openarm"):
+        return robot_config
+
+    left_open = _left_open()
+    left_closed = _left_closed()
+    right_open = _right_open()
+    right_closed = _right_closed()
+    robot_config.gripper_max = max(abs(left_open), abs(left_closed), abs(right_open), abs(right_closed))
+    if robot_config.rest_position_left:
+        robot_config.rest_position_left[-1] = left_open
+    if robot_config.rest_position_right:
+        robot_config.rest_position_right[-1] = right_open
+
+    arms = getattr(robot_config.arms_control_config, "arms", {})
+    for arm_name, arm_config in arms.items():
+        home_positions = getattr(arm_config, "home_positions", None)
+        if home_positions:
+            if arm_name.endswith("_l") or getattr(arm_config, "vr_controller", "") == "left":
+                home_positions[-1] = left_open
+            else:
+                home_positions[-1] = right_open
+    return robot_config
+
+
+def _patch_reset_handoff(controller):
+    cls = controller.QuestTeleopController
+    if getattr(cls, "_adamo_reset_handoff_patched", False):
+        return
+
+    original_on_reset_status = cls._on_reset_status
+    original_on_controls_owner = cls._on_controls_owner
+    original_on_left_commanded_ee = cls._on_left_commanded_ee
+    original_on_right_commanded_ee = cls._on_right_commanded_ee
+    original_on_joint_states = cls._on_joint_states
+    original_create_publisher = cls.create_publisher
+
+    class ForwardCommandPublisherGate:
+        def __init__(self, node, publisher, topic: str) -> None:
+            self._node = node
+            self._publisher = publisher
+            self._topic = topic
+            self._side = "left" if "follower_l" in topic else "right"
+            self._last_block_log = 0.0
+
+        def publish(self, msg) -> None:
+            blocked = getattr(self._node, "_adamo_blocked_sides", {"left", "right"})
+            if self._side in blocked:
+                import time
+
+                now = time.time()
+                if now - self._last_block_log > 1.0:
+                    self._node.get_logger().info(
+                        f"Adamo handoff patch: gated forward command on {self._topic}"
+                    )
+                    self._last_block_log = now
+                return
+
+            import time
+
+            ramp_until = getattr(self._node, "_adamo_ramp_until", {}).get(self._side, 0.0)
+            measured = getattr(self._node, "_adamo_measured_joints", {})
+            if hasattr(msg, "data") and msg.data:
+                data = list(msg.data)
+                desired = getattr(self._node, "_adamo_gripper_targets", {}).get(self._side)
+                if desired is not None:
+                    data[-1] = desired
+                    msg.data = data
+            if time.time() < ramp_until and measured and hasattr(msg, "data"):
+                arm = "follower_l" if self._side == "left" else "follower_r"
+                data = list(msg.data)
+                # The final element is the gripper. This covers six-axis YAM
+                # and seven-axis OpenArm without hard-coding either geometry.
+                names = [f"{arm}_joint{i}" for i in range(1, len(data))]
+                for index, name in enumerate(names):
+                    if index < len(data) and name in measured:
+                        current = measured[name]
+                        data[index] = max(current - 0.005, min(current + 0.005, data[index]))
+                msg.data = data
+            self._publisher.publish(msg)
+
+        def __getattr__(self, name: str):
+            return getattr(self._publisher, name)
+
+    def clear_control_state(self, reason: str) -> None:
+        try:
+            self._reset_control_state()
+            self.get_logger().info(f"Adamo handoff patch: cleared control state ({reason})")
+        except Exception as exc:
+            self.get_logger().warn(
+                f"Adamo handoff patch: failed to clear control state ({reason}): {exc}"
+            )
+
+    def patched_on_reset_status(self, msg):
+        previous = getattr(self, "_adamo_last_reset_state", None)
+        state = getattr(msg, "state", "")
+        if state != previous:
+            self._adamo_blocked_sides = {"left", "right"}
+        result = original_on_reset_status(self, msg)
+        if state != previous:
+            clear_control_state(self, f"reset_status={state}")
+            if state == "homed":
+                self.get_logger().info(
+                    "Adamo handoff patch: gated forward commands until fresh commanded EE"
+                )
+            self._adamo_last_reset_state = state
+        return result
+
+    def patched_on_controls_owner(self, msg):
+        owner = getattr(msg, "owner", "")
+        previous = getattr(self, "_adamo_last_controls_owner", None)
+        if owner == "quest_teleop" and owner != previous:
+            self._adamo_blocked_sides = {"left", "right"}
+            clear_control_state(self, "quest_teleop ownership claim")
+            self.get_logger().info(
+                "Adamo handoff patch: holding forward commands after ownership claim"
+            )
+        result = original_on_controls_owner(self, msg)
+        if owner != previous:
+            self._adamo_last_controls_owner = owner
+        return result
+
+    def unblock_for_fresh_command(self, side: str) -> None:
+        blocked = getattr(self, "_adamo_blocked_sides", {"left", "right"})
+        if side in blocked:
+            import time
+
+            blocked.discard(side)
+            self._adamo_blocked_sides = blocked
+            ramp_until = getattr(self, "_adamo_ramp_until", {})
+            ramp_until[side] = time.time() + 0.005
+            self._adamo_ramp_until = ramp_until
+            self.get_logger().info(
+                f"Adamo handoff patch: ramping {side} from measured joints"
+            )
+
+    def patched_on_joint_states(self, msg):
+        self._adamo_measured_joints = dict(zip(msg.name, msg.position))
+        return original_on_joint_states(self, msg)
+
+    def patched_on_left_commanded_ee(self, msg):
+        targets = getattr(self, "_adamo_gripper_targets", {})
+        targets["left"] = max(min(_left_open(), _left_closed()), min(max(_left_open(), _left_closed()), float(msg.gripper)))
+        self._adamo_gripper_targets = targets
+        unblock_for_fresh_command(self, "left")
+        return original_on_left_commanded_ee(self, msg)
+
+    def patched_on_right_commanded_ee(self, msg):
+        targets = getattr(self, "_adamo_gripper_targets", {})
+        targets["right"] = max(min(_right_open(), _right_closed()), min(max(_right_open(), _right_closed()), float(msg.gripper)))
+        self._adamo_gripper_targets = targets
+        unblock_for_fresh_command(self, "right")
+        return original_on_right_commanded_ee(self, msg)
+
+    def patched_create_publisher(self, msg_type, topic, *args, **kwargs):
+        publisher = original_create_publisher(self, msg_type, topic, *args, **kwargs)
+        if str(topic).endswith("_forward_position_controller/commands"):
+            self._adamo_blocked_sides = {"left", "right"}
+            if not hasattr(self, "_adamo_gripper_targets"):
+                self._adamo_gripper_targets = {
+                    "left": _left_open(),
+                    "right": _right_open(),
+                }
+            if not getattr(self, "_adamo_forward_gate_initialized", False):
+                self._adamo_forward_gate_initialized = True
+                self.get_logger().info(
+                    "Adamo handoff patch: forward commands gated at startup"
+                )
+            return ForwardCommandPublisherGate(self, publisher, str(topic))
+        return publisher
+
+    cls._on_reset_status = patched_on_reset_status
+    cls._on_controls_owner = patched_on_controls_owner
+    cls._on_left_commanded_ee = patched_on_left_commanded_ee
+    cls._on_right_commanded_ee = patched_on_right_commanded_ee
+    cls._on_joint_states = patched_on_joint_states
+    cls.create_publisher = patched_create_publisher
+    cls._adamo_reset_handoff_patched = True
+
+
+def main() -> int:
+    import quest_teleop.quest_teleop_controller as controller
+
+    original_load_robot_config = controller.load_robot_config
+    original_create_robot_config = controller.create_robot_config
+
+    def patched_load_robot_config(*args, **kwargs):
+        return _patch_robot_config(original_load_robot_config(*args, **kwargs))
+
+    def patched_create_robot_config(*args, **kwargs):
+        return _patch_robot_config(original_create_robot_config(*args, **kwargs))
+
+    controller.load_robot_config = patched_load_robot_config
+    controller.create_robot_config = patched_create_robot_config
+    _patch_reset_handoff(controller)
+    return int(controller.main() or 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
