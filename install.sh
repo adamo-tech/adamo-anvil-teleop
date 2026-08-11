@@ -35,6 +35,9 @@ run_as() { if [ "$(id -un)" = "$RUN_USER" ]; then "$@"; else $SUDO -u "$RUN_USER
 
 [ -f "$SRC_DIR/adamo_video.py" ]    || die "adamo_video.py not found next to install.sh"
 [ -f "$SRC_DIR/adamo_xr_relay.py" ] || die "adamo_xr_relay.py not found next to install.sh"
+[ -f "$SRC_DIR/patch_anvil_ros_containers.sh" ] || die "patch_anvil_ros_containers.sh not found next to install.sh"
+[ -f "$SRC_DIR/anvil_ros_patches/arms_resetter_node.py" ] || die "Anvil resetter patch asset is missing"
+[ -f "$SRC_DIR/anvil_ros_patches/quest_publisher" ] || die "Anvil Quest publisher patch asset is missing"
 say "Adamo teleop installer  (user=$RUN_USER  dir=$INSTALL_DIR  adamo==$ADAMO_VERSION)"
 
 # --- 0. interactive config (prompt up front, before any slow install work) ---
@@ -99,6 +102,17 @@ run_as cp "$SRC_DIR/adamo_video.py" "$SRC_DIR/adamo_xr_relay.py" "$INSTALL_DIR/"
 # even if the video service is down). Not wired to a service by default.
 [ -f "$SRC_DIR/adamo_xr_relay_zenoh.py" ] && run_as cp "$SRC_DIR/adamo_xr_relay_zenoh.py" "$INSTALL_DIR/" || true
 
+# Temporary workaround for the Anvil rehoming handoff bug. The timer also
+# catches ros2 containers recreated later by an anvil-loader image update.
+say "Installing the Anvil ROS rehoming safety patch…"
+run_as mkdir -p "$INSTALL_DIR/anvil_ros_patches"
+run_as cp "$SRC_DIR/patch_anvil_ros_containers.sh" "$INSTALL_DIR/"
+run_as cp "$SRC_DIR/anvil_ros_patches/arms_resetter_node.py" \
+  "$SRC_DIR/anvil_ros_patches/quest_publisher" "$INSTALL_DIR/anvil_ros_patches/"
+run_as chmod 755 "$INSTALL_DIR/patch_anvil_ros_containers.sh" \
+  "$INSTALL_DIR/anvil_ros_patches/arms_resetter_node.py" \
+  "$INSTALL_DIR/anvil_ros_patches/quest_publisher"
+
 # --- 4. write config (.env) --------------------------------------------------
 run_as tee "$ENV_FILE" >/dev/null <<EOF
 # Adamo teleop configuration. Org is derived from the API key — do not add it.
@@ -156,8 +170,36 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+$SUDO tee /etc/systemd/system/adamo-anvil-container-patch.service >/dev/null <<EOF
+[Unit]
+Description=Apply Adamo's temporary Anvil ROS rehoming safety patch
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/patch_anvil_ros_containers.sh
+EOF
+
+$SUDO tee /etc/systemd/system/adamo-anvil-container-patch.timer >/dev/null <<EOF
+[Unit]
+Description=Watch for recreated Anvil ROS containers that need the safety patch
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable adamo-video adamo-xr-relay >/dev/null 2>&1 || true
+$SUDO systemctl enable adamo-video adamo-xr-relay adamo-anvil-container-patch.timer >/dev/null 2>&1 || true
+# Patch and reload the running Anvil ROS entrypoints before starting teleop.
+$SUDO systemctl start adamo-anvil-container-patch.service
+$SUDO systemctl start adamo-anvil-container-patch.timer
 $SUDO systemctl restart adamo-video adamo-xr-relay
 sleep 3
 echo; say "Installed. Status:"
