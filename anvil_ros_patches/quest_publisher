@@ -2,68 +2,110 @@
 """Quest teleop entrypoint wrapper for safe Adamo commanded-EE handoff.
 
 The forward-command gate prevents the controller from replaying stale IK state
-after startup or a reset. OpenYAM additionally needs its calibrated asymmetric
-gripper range; OpenArm keeps the stock RobotConfig and symmetric hand range.
+after startup or a reset. Gripper limits default to Anvil's robot configuration
+and can be overridden explicitly through the environment.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 
 
-def _arm_type() -> str:
-    return os.environ.get("ANVIL_ARM_TYPE", "openyam").lower()
-
-
-def _profile_default(*, openyam: str, openarm: str) -> str:
-    return openarm if _arm_type().startswith("openarm") else openyam
+_gripper_ranges = {
+    "left": {"open": 0.045, "closed": 0.0},
+    "right": {"open": 0.045, "closed": 0.0},
+}
 
 
 def _right_open() -> float:
-    default = _profile_default(openyam="0.075", openarm="0.045")
-    return float(os.environ.get("ANVIL_GRIPPER_RIGHT_OPEN", os.environ.get("ANVIL_GRIPPER_MAX", default)))
+    default = os.environ.get("ANVIL_GRIPPER_MAX", str(_gripper_ranges["right"]["open"]))
+    return float(os.environ.get("ANVIL_GRIPPER_RIGHT_OPEN", default))
 
 
 def _right_closed() -> float:
-    return float(os.environ.get("ANVIL_GRIPPER_RIGHT_CLOSED", "0.0"))
+    return float(
+        os.environ.get("ANVIL_GRIPPER_RIGHT_CLOSED", str(_gripper_ranges["right"]["closed"]))
+    )
 
 
 def _left_open() -> float:
-    default = _profile_default(openyam="-0.035", openarm="0.045")
-    return float(os.environ.get("ANVIL_GRIPPER_LEFT_OPEN", default))
+    return float(
+        os.environ.get("ANVIL_GRIPPER_LEFT_OPEN", str(_gripper_ranges["left"]["open"]))
+    )
 
 
 def _left_closed() -> float:
-    default = _profile_default(openyam="-0.11", openarm="0.0")
-    return float(os.environ.get("ANVIL_GRIPPER_LEFT_CLOSED", default))
+    return float(
+        os.environ.get("ANVIL_GRIPPER_LEFT_CLOSED", str(_gripper_ranges["left"]["closed"]))
+    )
 
 
 def _patch_robot_config(robot_config):
-    # OpenArm's stock config already carries its correct 8-joint rest/home
-    # positions and hand limits. Only the custom OpenYAM hardware needs these
-    # values rewritten.
-    if _arm_type().startswith("openarm"):
-        return robot_config
-
-    left_open = _left_open()
-    left_closed = _left_closed()
-    right_open = _right_open()
-    right_closed = _right_closed()
-    robot_config.gripper_max = max(abs(left_open), abs(left_closed), abs(right_open), abs(right_closed))
-    if robot_config.rest_position_left:
-        robot_config.rest_position_left[-1] = left_open
-    if robot_config.rest_position_right:
-        robot_config.rest_position_right[-1] = right_open
-
+    native_open = {}
     arms = getattr(robot_config.arms_control_config, "arms", {})
     for arm_name, arm_config in arms.items():
         home_positions = getattr(arm_config, "home_positions", None)
         if home_positions:
-            if arm_name.endswith("_l") or getattr(arm_config, "vr_controller", "") == "left":
-                home_positions[-1] = left_open
-            else:
-                home_positions[-1] = right_open
+            side = (
+                "left"
+                if arm_name.endswith("_l")
+                or getattr(arm_config, "vr_controller", "") == "left"
+                else "right"
+            )
+            native_open[side] = float(home_positions[-1])
+
+    for side, rest_attr in (
+        ("left", "rest_position_left"),
+        ("right", "rest_position_right"),
+    ):
+        rest_positions = getattr(robot_config, rest_attr, None)
+        if side not in native_open and rest_positions:
+            native_open[side] = float(rest_positions[-1])
+        if side in native_open:
+            _gripper_ranges[side]["open"] = native_open[side]
+
+    override_names = {
+        "left": ("ANVIL_GRIPPER_LEFT_OPEN", "ANVIL_GRIPPER_LEFT_CLOSED"),
+        "right": ("ANVIL_GRIPPER_RIGHT_OPEN", "ANVIL_GRIPPER_RIGHT_CLOSED"),
+    }
+    if "ANVIL_GRIPPER_MAX" in os.environ and "ANVIL_GRIPPER_RIGHT_OPEN" not in os.environ:
+        _gripper_ranges["right"]["open"] = float(os.environ["ANVIL_GRIPPER_MAX"])
+
+    for side, (open_name, closed_name) in override_names.items():
+        if open_name in os.environ:
+            _gripper_ranges[side]["open"] = float(os.environ[open_name])
+        if closed_name in os.environ:
+            _gripper_ranges[side]["closed"] = float(os.environ[closed_name])
+
+    # Preserve Anvil's native robot configuration unless the operator supplied
+    # an explicit override for that side.
+    for arm_name, arm_config in arms.items():
+        side = (
+            "left"
+            if arm_name.endswith("_l")
+            or getattr(arm_config, "vr_controller", "") == "left"
+            else "right"
+        )
+        open_name, _ = override_names[side]
+        home_positions = getattr(arm_config, "home_positions", None)
+        if open_name in os.environ and home_positions:
+            home_positions[-1] = _gripper_ranges[side]["open"]
+
+    for side, rest_attr in (
+        ("left", "rest_position_left"),
+        ("right", "rest_position_right"),
+    ):
+        open_name, _ = override_names[side]
+        rest_positions = getattr(robot_config, rest_attr, None)
+        if open_name in os.environ and rest_positions:
+            rest_positions[-1] = _gripper_ranges[side]["open"]
+
+    if any(name in os.environ for names in override_names.values() for name in names):
+        robot_config.gripper_max = max(
+            abs(value)
+            for ranges in _gripper_ranges.values()
+            for value in ranges.values()
+        )
     return robot_config
 
 
