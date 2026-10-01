@@ -1,0 +1,13 @@
+{
+  "service": "adamo-video.service",
+  "script": "/home/anvil/adamo-recording-test/adamo_video.py",
+  "python": "/home/anvil/adamo-recording-test/venv/bin/python",
+  "environment_file": "/home/anvil/adamo-teleop/.env",
+  "sdk_version": "1.0.1",
+  "sdk_commit": "05269b5c799d270a13556096fc988b361ac8b3d9",
+  "sdk_wheel": "adamo-1.0.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+  "sdk_wheel_sha256": "7edcf51f836af1f8fcb690633308652d4b401e0a1f497e4f108c686ed5befb69",
+  "sdk_build": "https://github.com/adamo-tech/adamo/actions/runs/36864057688",
+  "source_service": "adamo-oak-stereo.service",
+  "source_shm": "camera/oak_stereo_nv12"
+}
