@@ -41,10 +41,7 @@ FPS = 30
 ROSBRIDGE = "ws://localhost:9090"
 OAK_STEREO_SHM = "camera/oak_stereo_nv12"
 OAK_WIDTH, OAK_HEIGHT = 2560, 2880
-WRIST_CAMERAS = (
-    ("wrist_left", "/cam_wrist_l/image_raw/compressed"),
-    ("wrist_right", "/cam_wrist_r/image_raw/compressed"),
-)
+WRIST_CAMERAS = ()  # Stereo-only deployment; wrist cameras remain disabled.
 WRIST_PROBE_SECONDS = 5.0
 # Recorded with every sample: what the arms did and what they were told to do.
 SAMPLED_TOPICS = (
